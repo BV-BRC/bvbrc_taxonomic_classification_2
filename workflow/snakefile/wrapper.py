@@ -70,21 +70,300 @@ def load_hisat_indicies(input_dict, hisat_indicies_path, input_dir):
     return
 
 
-def post_processing_check(all_sample_ids, output_dir):
-    dict_samples = {}
-    complete = []
-    incomplete = []
+def get_paired_and_single_sample_ids(input_dict):
+    paired_sample_ids = [clean_sample_id(item["sample_id"]) for item in input_dict.get("paired_end_libs", [])]
+    single_sample_ids = [clean_sample_id(item["sample_id"]) for item in input_dict.get("single_end_libs", [])]
+    return paired_sample_ids, single_sample_ids
+
+
+# Build the per-sample/per-step (Complete/Fail) rows for JobStatus.html.
+# Job-level steps (steps that produce one output for the whole job rather than
+# per sample) are reported under the pseudo-sample "Multisample".
+def build_job_status_rows(all_sample_ids, output_dir, input_dict, paired_sample_ids):
+    analysis_type = input_dict["analysis_type"]
+    host_genome = input_dict.get("host_genome", "no_host")
+    multi_sample = len(all_sample_ids) > 1
+    rows = []
+
     for sample_name in all_sample_ids:
-        # check for problematic Kraken results
-        krona_path = f"{output_dir}/{sample_name}_sankey.html"
-        if os.path.isfile(krona_path) == True:
-            msg = f"{sample_name}"
-            complete.append(msg)
+        is_paired = sample_name in paired_sample_ids
+
+        if is_paired:
+            fastqc_ok = all(
+                os.path.isfile(f"{output_dir}/{sample_name}/fastqc_results/raw_reads/raw_{sample_name}_R{read_num}_fastqc.html")
+                for read_num in (1, 2)
+            )
         else:
-            dict_samples[sample_name] = False
-            msg = f"{sample_name}"
-            incomplete.append(msg)
-    ## write the complete and incomplete samples to the error report for user to see ##
+            # se_fastq_processing_16s uses "raw_read" (singular); every other pipeline uses "raw_reads"
+            raw_reads_dir = "raw_read" if analysis_type == "16S" else "raw_reads"
+            fastqc_ok = os.path.isfile(f"{output_dir}/{sample_name}/fastqc_results/{raw_reads_dir}/raw_{sample_name}_fastqc.html")
+        rows.append((sample_name, "FastQC (raw reads)", fastqc_ok))
+
+        if analysis_type in ("pathogen", "microbiome") and host_genome != "no_host":
+            if is_paired:
+                host_removal_ok = all(
+                    os.path.isfile(f"{output_dir}/{sample_name}/hisat2_results/{sample_name}_host_removed_R{read_num}.fastq.gz")
+                    for read_num in (1, 2)
+                )
+            else:
+                host_removal_ok = os.path.isfile(f"{output_dir}/{sample_name}/hisat2_results/{sample_name}_host_removed.fastq.gz")
+            rows.append((sample_name, "Host Removal (HISAT2)", host_removal_ok))
+
+        if analysis_type == "16S":
+            if is_paired:
+                trim_ok = all(
+                    os.path.isfile(f"{output_dir}/{sample_name}/trimmed_reads/{sample_name}_R{read_num}_trimmed.fastq.gz")
+                    for read_num in (1, 2)
+                )
+            else:
+                trim_ok = os.path.isfile(f"{output_dir}/{sample_name}/trimmed_read/{sample_name}_trimmed.fastq.gz")
+            rows.append((sample_name, "Adapter Trimming (Trim Galore)", trim_ok))
+
+        kraken_ok = os.path.isfile(f"{output_dir}/{sample_name}/kraken_output/{sample_name}_k2_report.txt")
+        rows.append((sample_name, "Taxonomic Classification (Kraken2)", kraken_ok))
+
+        if analysis_type in ("microbiome", "16S"):
+            bracken_ok = os.path.isfile(f"{output_dir}/{sample_name}/bracken_output/{sample_name}_bracken_output.txt")
+            rows.append((sample_name, "Abundance Estimation (Bracken)", bracken_ok))
+
+            alpha_ok = os.path.isfile(f"{output_dir}/{sample_name}/{sample_name}_alpha_diversity.csv")
+            rows.append((sample_name, "Alpha Diversity", alpha_ok))
+
+        krona_ok = os.path.isfile(f"{output_dir}/{sample_name}_krona.html")
+        rows.append((sample_name, "Krona Plot", krona_ok))
+
+    if multi_sample:
+        rows.append(("Multisample", "Multisample Comparison", os.path.isfile(f"{output_dir}/multisample_comparison.html")))
+        rows.append(("Multisample", "Multisample Krona Plot", os.path.isfile(f"{output_dir}/multisample_krona.html")))
+        if analysis_type in ("microbiome", "16S"):
+            rows.append(("Multisample", "Beta Diversity", os.path.isfile(f"{output_dir}/beta_diversity.csv")))
+
+    if analysis_type in ("microbiome", "16S"):
+        rows.append(("Multisample", "Merged Alpha Diversity", os.path.isfile(f"{output_dir}/alpha_diversity.csv")))
+
+    sankey_file = "multisample_sankey.html" if multi_sample else "sankey.html"
+    rows.append(("Multisample", "Sankey Plot", os.path.isfile(f"{output_dir}/{sankey_file}")))
+
+    multiqc_report = "Taxonomic-Classification-Service-BVBRC_multiqc_report.html"
+    rows.append(("Multisample", "MultiQC Report", os.path.isfile(f"{output_dir}/{multiqc_report}")))
+
+    return rows
+
+
+def write_job_status_html(rows, output_dir):
+    table_rows = "\n".join(
+        f'<tr><td>{sample_name}</td><td>{step}</td>'
+        f'<td><span class="badge {"complete" if ok else "fail"}">{"&#10003; Complete" if ok else "&#10007; Fail"}</span></td></tr>'
+        for sample_name, step, ok in rows
+    )
+    num_failed = sum(1 for _, _, ok in rows if not ok)
+    summary_class = "complete" if num_failed == 0 else "fail"
+    summary_text = "All steps completed successfully" if num_failed == 0 else f"{num_failed} step(s) need review"
+
+    html = f"""<html>
+<head>
+<title>Taxonomic Classification Job Status</title>
+<style>
+body {{
+    font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: #f4f6f8;
+    color: #222;
+    margin: 0;
+    padding: 2.5em 1em;
+}}
+.container {{
+    max-width: 900px;
+    margin: 0 auto;
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+    overflow: hidden;
+}}
+.banner {{
+    background: linear-gradient(135deg, #1f3a5f, #2f6690);
+    color: #fff;
+    padding: 1.5em 2em;
+}}
+.banner h1 {{
+    margin: 0 0 0.2em 0;
+    font-size: 1.5em;
+}}
+.banner .summary {{
+    display: inline-block;
+    margin-top: 0.5em;
+    padding: 0.25em 0.8em;
+    border-radius: 999px;
+    font-size: 0.9em;
+    font-weight: 600;
+}}
+.banner .summary.complete {{ background: #2e7d46; color: #fff; }}
+.banner .summary.fail {{ background: #b3261e; color: #fff; }}
+table {{
+    border-collapse: collapse;
+    width: 100%;
+}}
+th, td {{
+    padding: 0.6em 1.2em;
+    text-align: left;
+}}
+thead th {{
+    background: #eef1f4;
+    color: #333;
+    font-size: 0.85em;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    border-bottom: 2px solid #dde2e7;
+}}
+tbody tr:nth-child(odd) {{ background: #fafbfc; }}
+tbody tr:hover {{ background: #eef4fa; }}
+td {{ border-bottom: 1px solid #eee; }}
+.badge {{
+    display: inline-block;
+    padding: 0.2em 0.7em;
+    border-radius: 999px;
+    font-size: 0.85em;
+    font-weight: 600;
+}}
+.badge.complete {{ background: #e3f5e9; color: #1e7d3c; }}
+.badge.fail {{ background: #fbe6e5; color: #b3261e; }}
+.steps {{
+    padding: 1.5em 2em 2em 2em;
+    border-top: 1px solid #eee;
+}}
+.steps h2 {{
+    font-size: 1.1em;
+    margin-bottom: 0.8em;
+}}
+.steps dl {{
+    margin: 0;
+}}
+.steps dt {{
+    font-weight: 600;
+    margin-top: 1em;
+}}
+.steps dd {{
+    margin: 0.2em 0 0 0;
+    color: #444;
+    line-height: 1.4em;
+}}
+.steps dd.advice {{
+    color: #444;
+    background: #fdf3f2;
+    border-left: 4px solid #b3261e;
+    border-radius: 4px;
+    padding: 0.6em 1em;
+    margin-top: 0.5em;
+}}
+.steps dd.advice > *:first-child {{ margin-top: 0; }}
+.steps dd.advice > *:last-child {{ margin-bottom: 0; }}
+.steps dd h3 {{
+    font-size: 1em;
+    margin: 0.6em 0 0.3em 0;
+    color: #222;
+}}
+.steps dd ul {{
+    margin: 0.4em 0;
+    padding-left: 1.2em;
+}}
+.steps dd li {{
+    margin-bottom: 0.3em;
+}}
+a {{ color: #2f6690; }}
+</style>
+</head>
+<body>
+<div class="container">
+<div class="banner">
+<h1>Taxonomic Classification Job Status</h1>
+<span class="summary {summary_class}">{summary_text}</span>
+</div>
+<table>
+<thead><tr><th>Sample</th><th>Step</th><th>Status</th></tr></thead>
+<tbody>
+{table_rows}
+</tbody>
+</table>
+<div class="steps">
+<h2>Pipeline Overview</h2>
+<dl>
+
+<dt>FastQC (raw reads)</dt>
+<dd>Runs quality control on the raw input reads.</dd>
+<dd class="advice">If this step failed, please review: check that your reads were fully uploaded to the workspace (see this <a href="https://www.bv-brc.org/docs/quick_references/workspaces/data_upload.html" target="_blank">data upload guide</a>). A common cause of failure is uploading a FASTA file where a FASTQ file was expected &mdash; see this <a href="https://sequenceserver.com/blog/fasta-vs-fastq-formats/" target="_blank">guide on FASTA vs. FASTQ formats</a>.</dd>
+
+<dt>Host Removal (HISAT2)</dt>
+<dd>Removes host-derived reads by aligning to the selected host genome (only runs if a host genome was specified).</dd>
+<dd class="advice">If this step failed, please review: confirm the host genome you selected actually matches the organism your reads were sequenced from.</dd>
+
+<dt>Adapter Trimming (Trim Galore)</dt>
+<dd>Trims sequencing adapters from the reads before classification. This step is specific to the 16S pipeline, which does not include a host-removal step.</dd>
+<dd class="advice">If this step failed, please review: the FastQC results for the raw reads &mdash; trimming failures are usually caused by the same malformed or empty input issues that would show up there.</dd>
+
+<dt>Taxonomic Classification (Kraken2)</dt>
+<dd>Assigns taxonomic labels to each read against the reference database.</dd>
+<dd class="advice">If this step failed, please review: the FastQC results for an explanation.</dd>
+
+<dt>Abundance Estimation (Bracken)</dt>
+<dd>Re-estimates species/genus-level abundance from the Kraken2 report.</dd>
+<dd class="advice">If this step failed, please review: consider rerunning your samples with the Species Identification pipeline, which relies solely on the Kraken2 results for all of its outputs.</dd>
+
+<dt>Alpha Diversity / Merged Alpha Diversity</dt>
+<dd>Calculates within-sample diversity statistics from the Bracken results.</dd>
+<dd class="advice">If this step failed, please review: the raw Kraken2 files available in your job results at &lt;sample_name&gt;/kraken_output/&lt;sample_name&gt;_k2_report.txt and &lt;sample_name&gt;/kraken_output/&lt;sample_name&gt;_k2_output.txt.</dd>
+
+<dt>Beta Diversity</dt>
+<dd>Calculates between-sample diversity comparisons (only runs when more than one sample is present).</dd>
+<dd class="advice">If this step failed, please review: confirm that Bracken completed successfully for every sample in the job &mdash; this step depends on all of them.</dd>
+
+<dt>Krona Plot / Multisample Krona Plot</dt>
+<dd>Interactive charts visualizing the taxonomic composition of each sample (or all samples combined).</dd>
+<dd class="advice">If this step failed, please review: the raw Kraken2 files available in your job results at &lt;sample_name&gt;/kraken_output/&lt;sample_name&gt;_k2_report.txt and &lt;sample_name&gt;/kraken_output/&lt;sample_name&gt;_k2_output.txt.</dd>
+
+<dt>Sankey Plot</dt>
+<dd>A flow diagram visualizing how reads are distributed across taxonomic ranks.</dd>
+<dd class="advice">If this step failed, please review: the raw Kraken2 files available in your job results at &lt;sample_name&gt;/kraken_output/&lt;sample_name&gt;_k2_report.txt and &lt;sample_name&gt;/kraken_output/&lt;sample_name&gt;_k2_output.txt.</dd>
+
+<dt>Multisample Comparison</dt>
+<dd>A combined comparison table across all samples in the job (only runs when more than one sample is present).</dd>
+<dd class="advice">If this step failed, please review: confirm that Kraken2 completed successfully for every sample in the job &mdash; this step depends on all of them.</dd>
+
+<dt>MultiQC Report</dt>
+<dd>Aggregates quality-control metrics from earlier steps into a single summary report.</dd>
+<dd class="advice">
+<h3>Using MultiQC for Troubleshooting</h3>
+<p>If the classification results are unexpected or difficult to interpret, reviewing read quality is often the best first troubleshooting step. Problems such as poor sequencing quality, adapter contamination, low-complexity reads, or an unusually low number of reads can reduce the number of confidently classified sequences and may lead to poor abundance estimates.</p>
+<p>The MultiQC report provides a convenient summary of these metrics across all samples. Pay particular attention to the following sections:</p>
+<ul>
+<li><strong>General Statistics</strong> &ndash; Verify the total number of reads and ensure the sample contains sufficient sequencing data.</li>
+<li><strong>Per Base Sequence Quality</strong> &ndash; Look for consistently high quality scores (typically Phred scores above 30). A sharp decline in quality toward the ends of reads may indicate the need for additional trimming.</li>
+<li><strong>Per Sequence Quality Scores</strong> &ndash; Check that most reads have high overall quality rather than a large fraction of low-quality reads.</li>
+<li><strong>Per Base Sequence Content</strong> &ndash; Large deviations from the expected nucleotide composition can indicate library preparation issues or contamination.</li>
+<li><strong>Adapter Content</strong> &ndash; High levels of adapter contamination suggest that trimming may be incomplete.</li>
+<li><strong>Sequence Duplication Levels</strong> &ndash; Excessive duplication may indicate PCR bias or low library complexity.</li>
+<li><strong>Overrepresented Sequences</strong> &ndash; Review any highly abundant sequences, which may represent contaminants, adapters, or other technical artifacts.</li>
+</ul>
+<p>While minor deviations are common, samples with low read counts, poor sequence quality, or substantial contamination may produce unreliable taxonomic classifications and abundance estimates. Reviewing the MultiQC report can help determine whether read quality, rather than the classification software, is responsible for unexpected results.</p>
+</dd>
+
+</dl>
+</div>
+</div>
+</body>
+</html>
+"""
+    with open(f"{output_dir}/JobStatus.html", "w") as job_status_file:
+        job_status_file.write(html)
+
+
+def post_processing_check(all_sample_ids, output_dir, input_dict):
+    paired_sample_ids, _ = get_paired_and_single_sample_ids(input_dict)
+    rows = build_job_status_rows(all_sample_ids, output_dir, input_dict, paired_sample_ids)
+    write_job_status_html(rows, output_dir)
+
+    complete = [f"{sample_name}: {step}" for sample_name, step, ok in rows if ok]
+    incomplete = [f"{sample_name}: {step}" for sample_name, step, ok in rows if not ok]
+
+    ## write the complete and incomplete steps to stderr for user to see ##
     if len(incomplete) != 0:
         msg = f"Reliable kraken results produced for the following samples: {complete}. \n \
                 Review the following samples: **{incomplete}** \n"
@@ -98,27 +377,12 @@ def post_processing_check(all_sample_ids, output_dir):
 
 def preprocessing_check(input_dir, output_dir, input_dict):
     ## Using the input dictionary instead of path from staging directory due to file name confusion
-    # Parse "sample_id" from "paired_end_libs"
-    paired_sample_ids = [item["sample_id"] for item in input_dict.get("paired_end_libs", [])]
-
-    # Parse "sample_id" from "single_end_libs"
-    single_sample_ids = [item["sample_id"] for item in input_dict.get("single_end_libs", [])]
-
+    paired_sample_ids, single_sample_ids = get_paired_and_single_sample_ids(input_dict)
     # Parse "sample_id" from "srr_libs"
-    srr_sample_ids = [item["sample_id"] for item in input_dict.get("srr_libs", [])]
+    srr_sample_ids = [clean_sample_id(item["sample_id"]) for item in input_dict.get("srr_libs", [])]
     # Merge all sample IDs into one list
     all_sample_ids = paired_sample_ids + single_sample_ids + srr_sample_ids
 
-    # Edit the sample ids to match the sample ids defined in set-up-sample-dictionary(input_dir input_dict output_dir cores)
-    clean_sample_ids = []
-    for sample_id in all_sample_ids:
-        # Define a regular expression pattern to match all special characters except underscore
-        pattern = r"[^a-zA-Z0-9_]"
-        # Use the re.sub() function to replace all matches of the pattern with an empty string
-        sample_id = re.sub(pattern, "", sample_id)
-        clean_sample_ids.append(sample_id)
-    all_sample_ids = clean_sample_ids
-        
     # file check for preprocessing/kraken run
     dict_samples = {}
     complete = []
@@ -186,7 +450,7 @@ def run_16s_snakefile(input_dict, input_dir, output_dir,  config):
             subprocess.run(cmd)
     # File check if anything is wrong with the kraken outputs it should fail to 
     # Produce krona plot
-    krona_check = post_processing_check(all_sample_ids, output_dir)
+    krona_check = post_processing_check(all_sample_ids, output_dir, input_dict)
     if krona_check == True:
         msg = "16s analysis is complete \n"
         sys.stderr.write(msg)
@@ -244,7 +508,7 @@ def run_wgs_snakefile(input_dict, input_dir, output_dir,  config):
             print(shlex.join(cmd), file=sys.stderr)
             subprocess.run(cmd)
     # Final file check
-    krona_check = post_processing_check(all_sample_ids, output_dir)
+    krona_check = post_processing_check(all_sample_ids, output_dir, input_dict)
     if krona_check == True:
         msg = " WGS analysis is complete \n"
         sys.stderr.write(msg)

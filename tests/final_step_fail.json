@@ -1,5 +1,5 @@
 {   
-    "failure_expected": 1,
+    "failure_expected": 0,
     "paired_sample_id": "",
     "single_sample_id": "",
     "srr_sample_id": "16S_fq",
